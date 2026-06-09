@@ -12,7 +12,7 @@
 #include "cpu/utils.hpp"
 
 namespace cpu_attention {
-enum class ISA { AMX, VEC, VEC16, NEON, VXE, NNPA };
+enum class ISA { AMX, VEC, VEC16, NEON, VXE, RVV, VSX, NNPA };
 
 template <ISA isa, typename scalar_t, int64_t head_dim>
 class AttentionImpl {};
@@ -149,6 +149,15 @@ struct AttentionMetadata {
         break;
       case ISA::VXE:
         ss << "VXE, ";
+        break;
+      case ISA::RVV:
+        ss << "RVV, ";
+        break;
+      case ISA::VSX:
+        ss << "VSX, ";
+        break;
+      case ISA::NNPA:
+        ss << "NNPA, ";
         break;
     }
     ss << "workitem_group_num: " << workitem_group_num
@@ -1084,11 +1093,6 @@ class AttentionMainLoop {
           curr_partial_q_buffer = partial_q_buffer;
           accum_c = true;
         }
-        if (ISAType == ISA::NNPA) {FILE*pf=fopen("/tmp/pv_out.txt","a"); if(pf){
-          fprintf(pf,"PV_OUT q_head_num=%d head_dim=%ld\n",q_head_num,(long)head_dim);
-          for(int r=0;r<q_head_num&&r<6;r++){fprintf(pf,"  row%d sum=%.4f: ",r,sum_buffer[r]);
-            for(int d=0;d<6;d++) fprintf(pf,"%.4f ",partial_q_buffer[r*head_dim+d]); fprintf(pf,"\n");}
-          fclose(pf);}}
       }
       //   if (debug_info) {
       //     print_logits("output", partial_q_buffer, q_head_num, head_dim,
@@ -1156,20 +1160,6 @@ class AttentionMainLoop {
                        int32_t kv_tile_token_num, bool is_first_iter,
                        bool use_sink) {
       // Debug: dump logits for decode (q_head_num==1 means 1 token)
-      if (q_head_num == 1 && kv_tile_token_num <= 32) {
-        static int sc=0; sc++;
-        if (sc <= 3) {
-          FILE* dbg=fopen("/tmp/logits_dump.txt","a");
-          if(dbg){
-            fprintf(dbg,"[%s call%d] q_head_num=%d kv_tile=%d logits[0:8]=",
-                    ISAType==ISA::NNPA?"NNPA":"VXE", sc, q_head_num, kv_tile_token_num);
-            for(int _i=0;_i<8&&_i<kv_tile_token_num;_i++)
-              fprintf(dbg,"%.4f ",logits_buffer[_i]);
-            fprintf(dbg,"\n");
-            fclose(dbg);
-          }
-        }
-      }
 #ifdef DEFINE_FAST_EXP
       DEFINE_FAST_EXP
       bool constexpr IsReducedPrecision =
@@ -1972,24 +1962,7 @@ class AttentionMainLoop {
                     const int32_t q_heads_per_kv,
                     const int32_t actual_q_token_num,
                     const int32_t q_head_num) {
-    if (ISAType == ISA::NNPA || ISAType == ISA::VXE) {
-      static int _fc=0; _fc++;
-      if(_fc<=24){FILE*f=fopen("/tmp/final_out.txt","a");if(f){
-        fprintf(f,"[%s call%d] sum=%.4f partial[0:8]=",
-                ISAType==ISA::NNPA?"NNPA":"VXE", _fc, sum_buffer[0]);
-        for(int i=0;i<8;i++) fprintf(f,"%.4f ",partial_q_buffer[i]);
-        fprintf(f,"\n");
-        fclose(f);}}}
     // Dump partial_q_buffer — all heads for first token
-    if (ISAType == ISA::NNPA || ISAType == ISA::VXE) {
-      static int _oc=0;
-      if(actual_q_token_num==1){
-        _oc++;
-        if(_oc<=q_head_num){FILE*f=fopen("/tmp/out_dump.txt","a");if(f){
-          fprintf(f,"[%s h%d] partial[0:8]=",ISAType==ISA::NNPA?"NNPA":"VXE",_oc-1);
-          for(int i=0;i<8;i++) fprintf(f,"%.4f ",partial_q_buffer[(_oc-1)*head_dim+i]);
-          fprintf(f," sum=%.4f\n",sum_buffer[_oc-1]);
-          fclose(f);}}}
     }
     // final output
     using output_vec_t = typename VecTypeTrait<query_t>::vec_t;

@@ -8,9 +8,8 @@
 // that offload to the Telum II on-chip AI accelerator.
 //
 // Operation mapping:
-//   Q x K^T  ->  zdnn_matmul_op()  ->  NNPA_MATMUL_OP
-//   softmax  ->  zdnn_softmax()    ->  NNPA_SOFTMAX
-//   P x V    ->  zdnn_matmul_op()  ->  NNPA_MATMUL_OP
+//   Q x K^T  ->  zdnn_matmul_bcast_op()  ->  NNPA_MATMUL_OP
+//   P x V    ->  CPU fallback (V tensor layout mismatch with NNPA)
 //
 // Reference: cpu_attn_vxe.hpp (VXE/s390x SIMD)
 
@@ -44,7 +43,6 @@ namespace {
   do {                                                                 \
     zdnn_status _st = (call);                                          \
     if (_st != ZDNN_OK) {                                              \
-      fprintf(stderr, "[NNPA] zDNN error at %s: status=%d\n",         \
               (msg), (int)_st);                                        \
       abort();                                                         \
     }                                                                  \
@@ -178,30 +176,10 @@ static void nnpa_matmul(const float* A, const float* B, float* C,
 
   // B is already [k, n] row-major — zdnn reads it correctly
 
-  // Debug: verify A and B before zdnn
-  {FILE* dbg=fopen("/tmp/b_layout.txt","a"); if(dbg){
-    fprintf(dbg,"nnpa_matmul: s=%d m=%d k=%d n=%d\n",s,m,k,n);
-    fprintf(dbg,"  A[head0,0:8]=");
-    for(int _j=0;_j<8;_j++) fprintf(dbg,"%.4f ",A[_j]);
-    fprintf(dbg,"\n");
-    fprintf(dbg,"  B[0:8] linear=");
-    for(int _j=0;_j<8;_j++) fprintf(dbg,"%.4f ",B[_j]);
-    fprintf(dbg,"\n");
-    fprintf(dbg,"  B col0 (B[i*n+0] for i=0..7)=");
-    for(int _i=0;_i<8;_i++) fprintf(dbg,"%.4f ",B[_i*(int)n+0]);
-    fprintf(dbg,"\n");
-    fclose(dbg);
   }}
 
-  // Debug: dump all A heads before zdnn
-  {FILE* dbg=fopen("/tmp/b_layout.txt","a"); if(dbg){
-    fprintf(dbg,"A all heads [m=%d,k=%d]:\n",m,k);
     for(uint32_t _h=0;_h<m;_h++){
-      fprintf(dbg,"  head%d[0:8]=",_h);
-      for(int _d=0;_d<8;_d++) fprintf(dbg,"%.4f ",A[_h*k+_d]);
-      fprintf(dbg,"\n");
     }
-    fclose(dbg);}}
   tA.init(s, m, k, A);
   tB.init(s, k, n, B, true);
   tC.init(s, m, n);
@@ -211,16 +189,6 @@ static void nnpa_matmul(const float* A, const float* B, float* C,
   assert(zero_bias != nullptr);
   tBias.init_1d(n, zero_bias);
   ::free(zero_bias);
-
-  {
-    static int call_cnt = 0;
-    call_cnt++;
-    FILE* dbg=fopen("/tmp/b_layout.txt","a");
-    if(dbg){
-      fprintf(dbg,"[call %d] s=%d m=%d k=%d n=%d ldc=%ld\n", call_cnt,s,m,k,n,(long)ldc);
-      fclose(dbg);
-    }
-  }
 
   ZDNN_CHECK(
     zdnn_matmul_bcast_op(&tA.zt, &tB.zt, &tBias.zt,
@@ -241,9 +209,6 @@ static void nnpa_matmul(const float* A, const float* B, float* C,
     tC.store(C);
   }
 
-  {FILE* dbg=fopen("/tmp/b_layout.txt","a"); if(dbg){
-    fprintf(dbg,"After zdnn m=%d n=%d\n",m,n); for(uint32_t _i=0;_i<m&&_i<6;_i++){fprintf(dbg,"row%d: ",_i);for(uint32_t _j=0;_j<6;_j++)fprintf(dbg,"%.4f ",C[_i*n+_j]);fprintf(dbg,"\n");}
-    fclose(dbg);}}
   if (a_buf) ::free(a_buf);
   if (b_buf) ::free(b_buf);
 
@@ -306,21 +271,9 @@ class TileGemmNNPA {
     // Resolve actual K at runtime
     const int32_t K = (k_size > 0) ? k_size : dynamic_k_size;
     {
-      FILE* f = fopen("/tmp/nnpa_debug.txt", "a");
       if (f) {
-        fprintf(f, "[NNPA] gemm: phase=%s m=%d K=%d N_block=%d lda=%ld ldb=%ld ldc=%ld accum=%d a_tile=%p\n",
                 (phase==AttentionGemmPhase::QK)?"QK":"PV",
                 m_size, K, block_size, (long)lda, (long)ldb, (long)ldc, (int)accum_c, (void*)a_tile);
-        fprintf(f, "  A_strided[rows@lda]:\n");
-        for(int _r=0;_r<m_size&&_r<6;_r++){fprintf(f,"    r%d: ",_r);
-          for(int _c=0;_c<8;_c++) fprintf(f,"%.4f ",a_tile[_r*(int)lda+_c]); fprintf(f,"\n");}
-        fprintf(f, "  A[0:8]=");
-        for(int i=0;i<8&&i<m_size*(int)K;i++) fprintf(f, "%.4f ", a_tile[i]);
-        fprintf(f, "\n");
-        fprintf(f, "  B[0:8]=");
-        for(int i=0;i<8;i++) fprintf(f, "%.4f ", (float)b_tile[i]);
-        fprintf(f, "\n");
-        fclose(f);
       }
     }
 
@@ -345,26 +298,11 @@ class TileGemmNNPA {
     if constexpr (phase == AttentionGemmPhase::QK) {
       // K cache layout: b_tile[dim * ldb + token] = K[dim, token]
       // Copy to contiguous: b_fp32[dim * N + token] = K[dim, token]
-      {static int dc=0; dc++;
-      if(dc<=3){FILE* dbg=fopen("/tmp/nnpa_bdump.txt","a"); if(dbg){
-        fprintf(dbg,"NNPA QK B K=%d N=%d ldb=%ld m=%d b_tile[0:8]: ",K,N,(long)ldb,m_size);
-        for(int i=0;i<8;i++) fprintf(dbg,"%.4f ",(float)b_tile[i]);
-        fprintf(dbg,"\n");
-        fclose(dbg);}}}
       for (int32_t i = 0; i < K; i++)
         for (int32_t j = 0; j < N; j++)
           b_fp32[i * N + j] = static_cast<float>(b_tile[i * ldb + j]);
-      {FILE* dbg=fopen("/tmp/b_layout.txt","a"); if(dbg){
-        fprintf(dbg,"QK B after  transpose: ");
-        for(int i=0;i<8;i++) fprintf(dbg,"%.4f ",b_fp32[i]);
-        fprintf(dbg,"\n");
-        fclose(dbg);}}
     } else {
       // V cache: b_tile[token*ldb + dim] = V[token, dim]
-      {static int pc=0;pc++;if(pc<=2){FILE*f=fopen("/tmp/pv_debug.txt","a");if(f){
-        fprintf(f,"PV: K=%d N=%d ldb=%ld b_tile[0:8]=",K,N,(long)ldb);
-        for(int i=0;i<8;i++) fprintf(f,"%.4f ",(float)b_tile[i]);
-        fprintf(f,"\n");fclose(f);}}}
       for (int32_t i = 0; i < K; i++)
         for (int32_t j = 0; j < N; j++)
           b_fp32[i * N + j] = static_cast<float>(b_tile[i * ldb + j]);
@@ -401,27 +339,6 @@ class TileGemmNNPA {
             _s += a_tile[_i*_lda+_d] * b_fp32[_d*_n+_j];
           c_out[_i*_ldc+_j] = _s;
         }
-    }
-
-    // Debug: dump QK scores and A matrix
-    if constexpr (phase == AttentionGemmPhase::QK) {
-      FILE* dbg=fopen("/tmp/b_layout.txt","a");
-      if(dbg){
-        fprintf(dbg,"QK m=%d K=%d N=%d\n", m_size, K, N);
-        fprintf(dbg,"A rows (Q heads):\n");
-        for(int _i=0;_i<m_size&&_i<6;_i++){
-          fprintf(dbg,"  Qhead%d: ",_i);
-          for(int _j=0;_j<6;_j++) fprintf(dbg,"%.4f ",a_tile[_i*(int)lda+_j]);
-          fprintf(dbg,"\n");
-        }
-        fprintf(dbg,"QK scores c_out rows:\n");
-        for(int _i=0;_i<m_size&&_i<6;_i++){
-          fprintf(dbg,"  head%d: ",_i);
-          for(int _j=0;_j<6;_j++) fprintf(dbg,"%.4f ",c_out[_i*N+_j]);
-          fprintf(dbg,"\n");
-        }
-        fclose(dbg);
-      }
     }
 
     // ── Accumulate if needed (C += C_new) ─────────────────────────────────
@@ -481,7 +398,6 @@ class AttentionImpl<ISA::NNPA, scalar_t, head_dim> {
   FORCE_INLINE void execute_attention(DEFINE_CPU_ATTENTION_PARAMS) {
     // Confirm NNPA is active
     {static bool _printed=false; if(!_printed){
-      fprintf(stderr,"[NNPA] Attention running on Telum II NNPA via zdnn\n");
       _printed=true;}}
     attention<TileGemmNNPA<kv_cache_t>> attention_iteration;
     attention_iteration(CPU_ATTENTION_PARAMS);
@@ -511,16 +427,6 @@ class AttentionImpl<ISA::NNPA, scalar_t, head_dim> {
                                 const int64_t q_num_stride,
                                 const int64_t q_head_stride,
                                 float scale) {
-    {static int gc=0; if(gc<3){FILE*rf=fopen("/tmp/q_rawsrc.txt","a"); if(rf){
-      fprintf(rf,"RAW src=%p num_stride=%ld head_stride=%ld q_num=%d\n",(void*)src,(long)q_num_stride,(long)q_head_stride,q_num);
-      for(int ii=0;ii<q_num&&ii<6;ii++){fprintf(rf,"  src+%d*ns [off=%ld]: ",ii,(long)(ii*q_num_stride));
-        for(int d=0;d<8;d++) fprintf(rf,"%.4f ",(float)src[ii*q_num_stride+d]); fprintf(rf,"\n");}
-      fclose(rf);} gc++;}}
-    {static int gc=0; if(gc<3){FILE*rf=fopen("/tmp/q_rawsrc.txt","a"); if(rf){
-      fprintf(rf,"RAW src=%p num_stride=%ld head_stride=%ld q_num=%d\n",(void*)src,(long)q_num_stride,(long)q_head_stride,q_num);
-      for(int ii=0;ii<q_num&&ii<6;ii++){fprintf(rf,"  src+%d*ns [off=%ld]: ",ii,(long)(ii*q_num_stride));
-        for(int d=0;d<8;d++) fprintf(rf,"%.4f ",(float)src[ii*q_num_stride+d]); fprintf(rf,"\n");}
-      fclose(rf);} gc++;}}
     for (int32_t i = 0; i < q_num; ++i) {
       for (int32_t h = 0; h < q_heads_per_kv; ++h) {
         const scalar_t* curr_src =
@@ -532,12 +438,7 @@ class AttentionImpl<ISA::NNPA, scalar_t, head_dim> {
           curr_dst[d] = static_cast<float>(curr_src[d]) * scale;
       }
     }
-    {FILE* gf=fopen("/tmp/q_gather.txt","a"); if(gf){
-      fprintf(gf,"GATHER q_num=%d hpk=%d num_stride=%ld head_stride=%ld scale=%.4f buf=%p src=%p\n",
               q_num,q_heads_per_kv,(long)q_num_stride,(long)q_head_stride,scale,(void*)q_buffer,(void*)src);
-      for(int32_t r=0;r<q_num&&r<6;r++){fprintf(gf,"  row%d: ",r);
-        for(int d=0;d<8;d++) fprintf(gf,"%.4f ",q_buffer[r*q_heads_per_kv*head_dim+d]);
-        fprintf(gf,"\n");} fclose(gf);}}
   }
 
   // ── reshape_and_cache ─────────────────────────────────────────────────────
@@ -580,15 +481,9 @@ class AttentionImpl<ISA::NNPA, scalar_t, head_dim> {
 
           for (int64_t i = 0, j = 0; i < head_dim; ++i, j += block_size)
             key_dst[j] = key_src[i];
-          // Debug: dump first 8 K values being stored
           if (token_idx == 0 && head_idx == 0) {
-            FILE* f = fopen("/tmp/kcache_debug.txt", "a");
             if (f) {
-              fprintf(f, "K stored[0:8]=");
               for (int i = 0; i < 8; i++)
-                fprintf(f, "%.4f ", (float)key_src[i]);
-              fprintf(f, "\n");
-              fclose(f);
             }
           }
         }
