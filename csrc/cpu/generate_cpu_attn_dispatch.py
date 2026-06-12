@@ -22,6 +22,7 @@ ISA_TYPES = {
     "VXE": 4,
     "RVV": 5,
     "VSX": 6,
+    "NNPA": 7,
 }
 
 # KV cache index: 0 = auto (same as scalar_t), 1 = fp8_e4m3, 2 = fp8_e5m2
@@ -39,7 +40,7 @@ KV_CACHE_CPP_TYPES = {
 }
 
 # ISAs supported for head_dims divisible by 32
-ISA_FOR_32 = ["AMX", "NEON", "VEC", "VEC16", "VXE", "RVV", "VSX"]
+ISA_FOR_32 = ["AMX", "NEON", "VEC", "VEC16", "VXE", "RVV", "VSX", "NNPA"]
 
 # ISAs supported for head_dims divisible by 16 only
 ISA_FOR_16 = ["VEC16"]
@@ -217,7 +218,7 @@ def generate_header_file() -> str:
     )
     header += _macro_block(
         "#elif defined(__s390x__)",
-        ["VXE", "VEC", "VEC16"],
+        ["VXE", "NNPA", "VEC", "VEC16"],
         fp8=False,
     )
     # RISC-V with RVV.  cpu_attn_rvv.hpp supports VLEN=128 and VLEN=256

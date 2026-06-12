@@ -12,7 +12,7 @@
 #include "cpu/utils.hpp"
 
 namespace cpu_attention {
-enum class ISA { AMX, VEC, VEC16, NEON, VXE, RVV, VSX };
+enum class ISA { AMX, VEC, VEC16, NEON, VXE, RVV, VSX, NNPA };
 
 // Mirrors csrc/attention/dtype_fp8.cuh Fp8KVCacheDataType exactly.
 enum class Fp8KVCacheDataType {
@@ -30,6 +30,13 @@ class AttentionImpl {
   void init_from_input(const AttentionInput*) {}
   float get_output_v_scale() const noexcept { return 1.0f; }
 };
+
+// Forward-declare NNPA specialization so it is visible to AttentionMainLoop
+// before cpu_attn_nnpa.hpp is included by cpu_attn_dispatch_generated.h.
+#ifdef __s390x__
+template <typename scalar_t, int64_t head_dim, typename kv_cache_scalar_t>
+class AttentionImpl<ISA::NNPA, scalar_t, head_dim, kv_cache_scalar_t>;
+#endif
 
 struct AttentionWorkItemGroup {
   int32_t req_id;

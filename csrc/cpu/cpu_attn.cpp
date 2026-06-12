@@ -1,4 +1,7 @@
 #include "cpu_attn_dispatch_generated.h"
+#ifdef __s390x__
+#include "cpu_attn_nnpa.hpp"
+#endif
 
 // Maps kv_cache_dtype string to Fp8KVCacheDataType enum.
 // "auto" -> kAuto(0); "fp8"/"fp8_e4m3" -> kFp8E4M3; "fp8_e5m2" -> kFp8E5M2.
@@ -29,6 +32,8 @@ torch::Tensor get_scheduler_metadata(
     isa = cpu_attention::ISA::NEON;
   } else if (isa_hint == "vxe") {
     isa = cpu_attention::ISA::VXE;
+  } else if (isa_hint == "nnpa") {
+    isa = cpu_attention::ISA::NNPA;
   } else if (isa_hint == "rvv") {
     isa = cpu_attention::ISA::RVV;
   } else if (isa_hint == "vsx") {
@@ -133,6 +138,8 @@ void cpu_attn_reshape_and_cache(
       return cpu_attention::ISA::NEON;
     } else if (isa == "vxe") {
       return cpu_attention::ISA::VXE;
+    } else if (isa == "nnpa") {
+      return cpu_attention::ISA::NNPA;
     } else if (isa == "rvv") {
       return cpu_attention::ISA::RVV;
     } else if (isa == "vsx") {
